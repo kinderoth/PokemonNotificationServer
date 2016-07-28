@@ -1,14 +1,17 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net;
-using System.Text;
-using System.Threading.Tasks;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
-using System.IO;
-using PushbulletSharp;
+using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
+using IniParser;
+using IniParser.Model;
+using Newtonsoft.Json;
+using PushbulletSharp;
+using PushbulletSharp.Models.Responses;
 
 namespace PokemonServer
 {
@@ -34,21 +37,66 @@ namespace PokemonServer
         static HttpListener listener;
         static bool exitHandled = false;
         static bool exiting = false;
+        static ApplicationConfig appConfig = null;
+        static PushbulletClient pbClient = null;
+        static string pbEmail = null;
+        static Device pbDevice = null;
+        static readonly bool SingleThread = false;
 
         [STAThread]
         static void Main( string[] args )
         {
             Console.CancelKeyPress += HandleProgramTermination;
+            appConfig = ParseConfig();
+
+            if ( String.IsNullOrWhiteSpace( appConfig.Listener_Address ) )
+            {
+                Console.WriteLine( "Listener Address not Configured. Exiting..." );
+                return;
+            }
+
+            if ( appConfig.PokemonToNotifyFor.Count == 0 )
+            {
+                Console.WriteLine( "No Pokemon Configured for Notifications. Exiting..." );
+                return;
+            }
+
+            if ( String.IsNullOrWhiteSpace( appConfig.PushBulletAPIKey ) )
+            {
+                Console.WriteLine( "Pushbullet Access Token is Invalid" );
+                return;
+            }
+
+            if ( String.IsNullOrWhiteSpace( appConfig.DeviceID.Trim() ) )
+            {
+                appConfig.DeviceID = null;
+            }
+
+            // Set up the pushbullet client
+            pbClient = new PushbulletClient( appConfig.PushBulletAPIKey );
+
+            if ( appConfig.DeviceID != null )
+            {
+                var devices = pbClient.CurrentUsersDevices();
+                pbDevice = devices.Devices.Where( o => o.Iden.Equals( appConfig.DeviceID ) ).FirstOrDefault();
+                pbEmail = null;
+            }
+            else
+            {
+                var currentUserInformation = pbClient.CurrentUsersInformation();
+                pbEmail = currentUserInformation.Email;
+                pbDevice = null;
+            }
 
             listener = new HttpListener();
-            listener.Prefixes.Add( "http://localhost:1337/pokemonz/" );
+            listener.Prefixes.Add( appConfig.Listener_Address );
             HandledEncounters = new Dictionary<string, double>( 500 );
             LastCleanTime = DateTime.MinValue;
             openTasks = new List<Task>();
             exiting = false;
 
             listener.Start();
-            for ( ; ; )
+            for ( ;;)
             {
                 if ( exiting == true )
                 {
@@ -64,18 +112,26 @@ namespace PokemonServer
                     break;
                 }
 
-                Task task = Task.Factory.StartNew( () =>
-                    {
-                        HandleRequest( ctx.Request );
-                    } ).ContinueWith( t =>
-                    {
-                        lock ( taskListLock )
+                if ( SingleThread == false )
+                {
+                    Task task = Task.Factory.StartNew( () =>
                         {
-                            openTasks.Remove( t );
-                        }
-                    } );
+                            HandleRequest( ctx.Request );
+                        } ).ContinueWith( t =>
+                        {
+                            lock ( taskListLock )
+                            {
+                                openTasks.Remove( t );
+                            }
+                        } );
 
-                openTasks.Add( task );
+                    openTasks.Add( task );
+                }
+                else
+                {
+                    HandleRequest( ctx.Request );
+                    break;
+                }
             }
         }
 
@@ -83,6 +139,19 @@ namespace PokemonServer
         {
             PokemonPOST msg = DeserializeFromStream( request.InputStream );
             Pokemon foundPokemon = new Pokemon( msg.Message.Pokemon_ID );
+
+            // INI File can't Handle Male/Female Signs so we need special cases to handle their config names
+            if ( !appConfig.PokemonToNotifyFor.Contains( foundPokemon.Name )
+              && ( foundPokemon.ID != 29
+                || ( foundPokemon.ID == 29 &&
+                     !appConfig.PokemonToNotifyFor.Contains( "Nidoran_Female" ) ) )
+              && ( foundPokemon.ID != 32
+                || ( foundPokemon.ID == 32 &&
+                     !appConfig.PokemonToNotifyFor.Contains( "Nidoran_Male" ) ) ) )
+            {
+                // Don't notify for this pokemon
+                return;
+            }
 
             bool handlingRequest = false;
             lock ( encounterLockObject )
@@ -96,9 +165,47 @@ namespace PokemonServer
 
             if ( handlingRequest == true )
             {
+                string title = String.Format( "A wild {0} has appeared!", foundPokemon.Name );
+                string url = String.Format( "http://maps.google.com/?q={0},{1}", msg.Message.Latitude, msg.Message.Longitude );
+
+                DateTime dt = UnixTimeStampToDateTime( msg.Message.Disappear_Time ) + TimeZoneInfo.Local.GetUtcOffset( DateTime.Now );
+                TimeSpan diff = dt - DateTime.Now;
+
+                if ( diff.Minutes < 0 || diff.Minutes > 45 )
+                {
+                    Debugger.Break();
+                }
+
+                string body = String.Format( "Available until {0} ({1}m {2}s)", dt.ToLongTimeString(), diff.Minutes, diff.Seconds );
+
+                if ( pbDevice != null )
+                {
+                    PushbulletSharp.Models.Requests.PushLinkRequest pushRequest = new PushbulletSharp.Models.Requests.PushLinkRequest()
+                    {
+                        DeviceIden = pbDevice.Iden,
+                        Title = title,
+                        Url = url,
+                        Body = body
+                    };
+
+                    pbClient.PushLink( pushRequest );
+                }
+                else
+                {
+                    PushbulletSharp.Models.Requests.PushLinkRequest pushRequest = new PushbulletSharp.Models.Requests.PushLinkRequest()
+                    {
+                        Email = pbEmail,
+                        Title = title,
+                        Url = url,
+                        Body = body
+                    };
+
+                    pbClient.PushLink( pushRequest );
+                }
+
                 lock ( writeToConsoleLock )
                 {
-                    Console.WriteLine( String.Format( "Notified Player of {0} - {1}", foundPokemon.Name, msg.Message.Encounter_ID ) );
+                    Console.WriteLine( String.Format( "Notified Player of a {0} - ID: {1}", foundPokemon.Name, msg.Message.Encounter_ID ) );
                 }
             }
         }
@@ -111,7 +218,7 @@ namespace PokemonServer
             {
                 using ( var jsonTextReader = new JsonTextReader( sr ) )
                 {
-                    return serializer.Deserialize <PokemonPOST>( jsonTextReader );
+                    return serializer.Deserialize<PokemonPOST>( jsonTextReader );
                 }
             }
         }
@@ -162,16 +269,81 @@ namespace PokemonServer
                     Dictionary<string, double> tempDict = new Dictionary<string, double>();
                     lock ( encounterLockObject )
                     {
-                        tempDict = new Dictionary<string,double>( HandledEncounters );
+                        tempDict = new Dictionary<string, double>( HandledEncounters );
                     }
 
                     List<string> encountersToRemove = new List<string>();
-                    foreach ( KeyValuePair<string,double> kv in tempDict )
+                    foreach ( KeyValuePair<string, double> kv in tempDict )
                     {
                         double time = kv.Value;
                     }
                 }
             }
+        }
+
+        static ApplicationConfig ParseConfig()
+        {
+            ApplicationConfig cfg = new ApplicationConfig();
+            string cfgPath = Path.Combine( Path.GetDirectoryName( Assembly.GetExecutingAssembly().Location ), "config.ini" );
+
+            FileIniDataParser parser = new FileIniDataParser();
+            IniData data = parser.ReadFile( cfgPath );
+
+            KeyDataCollection settingsData = data[ "Settings" ];
+            KeyDataCollection pokemonData = data[ "Pokemon" ];
+
+            if ( settingsData != null )
+            {
+                cfg.Listener_Address = settingsData[ "Listener_Address" ];
+                cfg.PushBulletAPIKey = settingsData[ "PB_Access_Token" ];
+                cfg.DeviceID = settingsData[ "Device_To_Send_ID" ];
+            }
+
+            if ( pokemonData != null )
+            {
+                foreach ( KeyData kd in pokemonData )
+                {
+                    if ( bool.Parse( kd.Value ) == true )
+                    {
+                        cfg.PokemonToNotifyFor.Add( kd.KeyName.Trim() );
+                    }
+                }
+            }
+
+            return cfg;
+        }
+
+        static DateTime UnixTimeStampToDateTime( double unixTimeStamp )
+        {
+            // Unix timestamp is seconds past epoch
+            System.DateTime dtDateTime = new DateTime( 1970, 1, 1, 0, 0, 0, 0, System.DateTimeKind.Utc );
+            dtDateTime = dtDateTime.AddSeconds( unixTimeStamp ).ToLocalTime();
+            return dtDateTime;
+        }
+    }
+
+    class ApplicationConfig
+    {
+        public string Listener_Address { get; set; }
+        public string PushBulletAPIKey { get; set; }
+        public string DeviceID { get; set; }
+        public List<string> PokemonToNotifyFor { get; set; }
+
+        public ApplicationConfig()
+        {
+            this.PokemonToNotifyFor = new List<string>();
+        }
+
+        public ApplicationConfig( string address )
+        {
+            this.Listener_Address = address;
+            this.PokemonToNotifyFor = new List<string>();
+        }
+
+        public ApplicationConfig( string address, List<string> pokemonToNotify )
+        {
+            this.Listener_Address = address;
+            this.PokemonToNotifyFor = pokemonToNotify;
         }
     }
 
